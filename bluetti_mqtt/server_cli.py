@@ -158,10 +158,13 @@ def setup_logging(level):
         level=level
     )
 
-def main(argv):
+def main(argv=None):
+    if not argv:
+        argv = sys.argv
+
     cli = CommandLineHandler(argv)
     cli.execute()
 
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
