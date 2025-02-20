@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import dataclass
 from enum import auto, Enum, unique
 import json
@@ -9,6 +10,7 @@ from asyncio_mqtt import Client, MqttError
 from paho.mqtt.client import MQTTMessage
 from bluetti_mqtt.bus import CommandMessage, EventBus, ParserMessage
 from bluetti_mqtt.core import BluettiDevice, DeviceCommand
+from bluetti_mqtt.core.utils import parse_value, is_line_protocol_supported
 
 
 @unique
@@ -485,6 +487,31 @@ def battery_pack_fields(pack: int):
     }
 
 
+def map_field_type_to_default_value(field_type: MqttFieldType):
+    if field_type == MqttFieldType.BOOL:
+        return False
+    elif field_type == MqttFieldType.NUMERIC:
+        return 0
+    elif field_type == MqttFieldType.ENUM:
+        return None
+    elif field_type == MqttFieldType.BUTTON:
+        return None
+    else:
+        raise AssertionError(f'unhandled field type: {field_type}')
+
+
+def map_field_type_to_value(field_type: MqttFieldType, value: str):
+    if field_type == MqttFieldType.BOOL:
+        return value == 'ON'
+    elif field_type == MqttFieldType.NUMERIC:
+        return int(value)
+    elif field_type == MqttFieldType.ENUM:
+        return value
+    elif field_type == MqttFieldType.BUTTON:
+        return None
+    else:
+        raise AssertionError(f'unhandled field type: {field_type}')
+
 class MQTTClient:
     devices: List[BluettiDevice]
     message_queue: asyncio.Queue
@@ -505,6 +532,8 @@ class MQTTClient:
         self.password = password
         self.home_assistant_mode = home_assistant_mode
         self.devices = []
+        self.last_message = {field_name: map_field_type_to_default_value(field.type) for field_name, field in
+                             NORMAL_DEVICE_FIELDS.items()}
 
     async def run(self):
         while True:
@@ -669,50 +698,65 @@ class MQTTClient:
         await self.bus.put(CommandMessage(device, cmd))
 
     async def _handle_message(self, client: Client, msg: ParserMessage):
+        device_name = f"{msg.device.type}-{msg.device.sn}"
         logging.debug(f'Got a message from {msg.device}: {msg.parsed}')
-        topic_prefix = f'bluetti/state/{msg.device.type}-{msg.device.sn}/'
+        topic = f'bluetti/state/{device_name}'
 
         # Publish normal fields
         for name, value in msg.parsed.items():
             # Skip unconfigured fields
-            if name not in NORMAL_DEVICE_FIELDS:
+            if name not in self.last_message:
                 continue
 
-            # Build payload string
-            field = NORMAL_DEVICE_FIELDS[name]
-            if field.type == MqttFieldType.NUMERIC:
-                payload = str(value)
-            elif field.type == MqttFieldType.BOOL or field.type == MqttFieldType.BUTTON:
-                payload = 'ON' if value else 'OFF'
-            elif field.type == MqttFieldType.ENUM:
-                payload = value.name
-            else:
-                assert False, f'Unhandled field type: {field.type.name}'
+            self.last_message[name] = map_field_type_to_value(NORMAL_DEVICE_FIELDS[name].type, value)
 
-            await client.publish(topic_prefix + name, payload=payload.encode())
+        tags_str = (f"device_name={device_name}"
+                    f",device_type={msg.device.type}"
+                    f",device_sn={msg.device.sn}")
+        fields_str = ",".join(
+            [
+                f"{key}={parse_value(value)}"
+                for key, value in self.last_message.items()
+                if is_line_protocol_supported(value)
+            ]
+        )
+
+        line_protocol_txt = (
+            # measurement
+            f"bluetti,"
+            # tag_set
+            f"{tags_str} "
+            # fields_set
+            f"{fields_str} "
+            # timestamp
+            f"{time.time_ns()}"
+            # newline
+            "\n"
+        )
+        await client.publish(topic, payload=line_protocol_txt.encode())
 
         # Publish battery pack data
         pack_details = self._build_pack_details(msg.parsed)
         if 'pack_num' in msg.parsed and len(pack_details) > 0:
             await client.publish(
-                topic_prefix + f'pack_details{msg.parsed["pack_num"]}',
+                topic + f'/pack_details{msg.parsed["pack_num"]}',
                 payload=json.dumps(pack_details, separators=(',', ':')).encode()
             )
 
         # Publish DC input data
         if 'internal_dc_input_voltage' in msg.parsed:
             await client.publish(
-                topic_prefix + 'dc_input_voltage1',
+                topic + '/dc_input_voltage1',
                 payload=str(msg.parsed['internal_dc_input_voltage']).encode()
             )
         if 'internal_dc_input_power' in msg.parsed:
             await client.publish(
-                topic_prefix + 'dc_input_power1',
+                topic + '/dc_input_power1',
                 payload=str(msg.parsed['internal_dc_input_power']).encode()
             )
         if 'internal_dc_input_current' in msg.parsed:
             await client.publish(
-                topic_prefix + 'dc_input_current1',
+                topic + '/dc_input_current1',
                 payload=str(msg.parsed['internal_dc_input_current']).encode()
             )
 
